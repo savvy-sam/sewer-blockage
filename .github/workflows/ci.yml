@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Compile all modules (catches truncation / syntax errors)
+        run: python -m py_compile *.py
+      - name: Assert generate.py has a main() entrypoint
+        run: python -c "import generate; assert hasattr(generate, 'main'), 'generate.py is missing main()'"
+      - name: Short SWMM smoke run
+        run: python tests/ci_smoke.py

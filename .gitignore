@@ -1,0 +1,7 @@
+data/
+ci_out/
+*.parquet
+*.zip
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
