@@ -28,6 +28,7 @@ chokes it almost shut. This mapping is exact for area, documented, and applied
 identically across all runs.
 """
 from __future__ import annotations
+import datetime as _dt
 import math
 import re
 from dataclasses import dataclass, field
@@ -253,3 +254,27 @@ def set_rain_file(text: str, dat_filename: str) -> str:
 
 def raingage_names(model: InpModel) -> list:
     return [tok[0] for tok in model._data_rows("RAINGAGES")]
+
+
+def node_is_outfall(model: InpModel, node: str) -> bool:
+    return any(tok[0] == node for tok in model._data_rows("OUTFALLS"))
+
+
+def add_inflow_surge(text: str, node: str, ts_name: str, breakpoints: list, start_dt) -> str:
+    """Add a direct external inflow (CMS) at `node`, driven by a time series.
+
+    Used for Scenario 5 (non-blockage backwater): a transient surge injected just
+    downstream of the sensor raises the local HGL and backs water up the target
+    conduit (depth rises, flow falls) WITHOUT any blockage.
+
+    breakpoints: list of (minute_from_start, value_cms); SWMM interpolates linearly.
+    """
+    ts_lines = []
+    for minute, val in breakpoints:
+        t = start_dt + _dt.timedelta(minutes=int(minute))
+        ts_lines.append(f"{ts_name:<16} {t:%m/%d/%Y} {t:%H:%M}  {val:.5f}")
+    text = _append_to_section(text, "TIMESERIES", ts_lines)
+    text = _append_to_section(
+        text, "INFLOWS",
+        [f"{node:<16} FLOW             {ts_name:<16} FLOW     1.0        1.0        0"])
+    return text

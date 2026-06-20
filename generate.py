@@ -1,20 +1,23 @@
 """
 generate.py
 ===========
-Core-4 sewer-blockage data generator for the Bellinge SWMM model.
+Sewer-blockage data generator for the Bellinge SWMM model (Scenarios 1-7).
 
 Scenarios (per PySWMM_Scenarios_Revised.docx, Part 1):
   1 Baseline Normal        7 d     dry, diurnal only            -> normal
   2 Pure Rainfall Rise     48-72 h 24h dry -> storm -> recovery -> rainfall
   3 Dry Weather Blockage   48-72 h blockage ramps hrs 24-36     -> blockage
   4 Wet Weather Blockage   5-7 d   blockage forms, storm ~1d on -> blockage
+  5 Non-Blockage Backwater 48-72 h downstream surge raises depth-> normal (hard neg)
+  6 Blockage Clearance     3-5 d   blockage forms then removed  -> blockage->normal
+  7 Near-Surcharge Storm   48-72 h extreme storm, no blockage   -> rainfall (hard neg)
 
-Per-run randomisation (Part 2 axes that apply to Core-4): blockage severity,
-instant vs gradual ramp, injection node, rainfall intensity/duration, rainfall
-spatial heterogeneity, antecedent dry-weather duration + antecedent precip index.
-Onset time and injection node are randomised so timing/location are not learnable
-artefacts. A controllable inline orifice is inserted in EVERY run (held open when
-no blockage) to keep topology decorrelated from the label.
+Per-run randomisation: blockage severity, instant vs gradual ramp, injection node,
+rainfall intensity/duration, rainfall spatial heterogeneity, antecedent dry-weather
+duration + antecedent precip index. Onset time and injection node are randomised so
+timing/location are not learnable artefacts. A controllable inline orifice is
+inserted in EVERY run (held open when no blockage) to keep topology decorrelated
+from the label.
 
 Labelling priority: blockage > rainfall-driven > normal.
   * blockage  : severity(t) >= ONSET_SEVERITY (explicit, constant threshold)
@@ -90,9 +93,19 @@ def select_sensor_conduits(model: S.InpModel, target: str, k_hops: int = 2) -> l
 # --------------------------------------------------------------------------- #
 # Severity schedule + labels
 # --------------------------------------------------------------------------- #
-def severity_at(t_min, onset_min, ramp_min, final_sev):
+def severity_at(t_min, onset_min, ramp_min, final_sev,
+                clear_onset=None, clear_ramp=0):
+    """Blockage severity over time: ramp up to final_sev, hold, and (Scenario 6)
+    optionally clear back to 0 starting at clear_onset over clear_ramp minutes
+    (clear_ramp=0 => instant removal)."""
     if final_sev <= 0 or t_min < onset_min:
         return 0.0
+    # clearance phase (overrides plateau once it begins)
+    if clear_onset is not None and t_min >= clear_onset:
+        if clear_ramp <= 0 or t_min >= clear_onset + clear_ramp:
+            return 0.0
+        return max(0.0, final_sev * (1.0 - (t_min - clear_onset) / clear_ramp))
+    # rising / plateau
     if ramp_min <= 0 or t_min >= onset_min + ramp_min:
         return final_sev
     return final_sev * (t_min - onset_min) / ramp_min
@@ -159,6 +172,15 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
     dat_name = "rain_run.dat"
     write_rain_dat(os.path.join(rundir, dat_name), start, gage_series)
     text = S.set_rain_file(text, dat_name)
+
+    # --- non-blockage backwater (Scenario 5): transient downstream inflow surge ---
+    if params.get("bw"):
+        bw = params["bw"]
+        o, rmp, hold, pk = bw["onset_min"], bw["ramp_min"], bw["hold_min"], bw["peak_cms"]
+        bps = [(0, 0.0), (o, 0.0), (o + rmp, pk), (o + rmp + hold, pk),
+               (o + rmp + hold + rmp, 0.0), (n_min, 0.0)]
+        text = S.add_inflow_surge(text, blk.n2, f"BW_{params['target']}", bps, start)
+
     inp_path = os.path.join(rundir, "run.inp")
     with open(inp_path, "w") as fh:
         fh.write(text)
@@ -182,7 +204,9 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
         for _ in sim:
             t_min = i
             sev = severity_at(t_min, params["onset_min"], params["ramp_min"],
-                              params["final_sev"])
+                              params["final_sev"],
+                              params.get("clear_onset_min"),
+                              params.get("clear_ramp_min", 0))
             orf.target_setting = S.severity_to_setting(sev)
             severities.append(sev)
             row = {"t_min": t_min,
@@ -207,7 +231,7 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
     intensity = basin_series[:len(df)]
 
     # --- labels (priority blockage > rainfall > normal) ---
-    # rainfall is now a *response-based* label: depth must rise above its diurnal
+    # rainfall is a *response-based* label: depth must rise above its diurnal
     # dry-weather baseline during/after rain (not merely "it is raining").
     blk_mask = severities >= ONSET_SEVERITY
     start_tod = BASE_START.hour * 60 + BASE_START.minute
@@ -268,7 +292,8 @@ def choke_targets(targets_csv: str, top_k: int = 40, sort_col: str = "V_p10_dry"
 
 
 def sample_params(scenario: int, run_idx: int, rng, targets: list, gages: list,
-                  report_step_s: int, routing_step_s: int, k_hops: int) -> dict:
+                  report_step_s: int, routing_step_s: int, k_hops: int,
+                  target_qmax: dict | None = None) -> dict:
     seed = int(rng.integers(0, 2 ** 31))
     r = np.random.default_rng(seed)
     target = str(r.choice(targets))
@@ -305,6 +330,34 @@ def sample_params(scenario: int, run_idx: int, rng, targets: list, gages: list,
         st = sample_storm(r, storm_onset)
         base.update(duration_h=dur, storms=[st.__dict__],
                     final_sev=sev, onset_min=blk_onset, ramp_min=ramp)
+    elif scenario == 5:                     # Non-Blockage Backwater, 48-72 h -> normal
+        dur = int(r.choice([48, 60, 72]))
+        onset = int(r.integers(24 * 60, 36 * 60))
+        ramp = int(r.choice([60, 120]))                # surge rise time
+        hold = int(r.integers(2 * 60, 8 * 60))
+        qmax_ls = float((target_qmax or {}).get(target, 2.0))   # pipe capacity, L/s
+        # surge must dwarf pipe capacity to back water up (flow falls/reverses);
+        # too small and it just drains downstream. Magnitude is location-dependent
+        # (downstream capacity) — inspect S5 depth/flow and tune this range if needed.
+        peak = float(r.uniform(8.0, 20.0)) * qmax_ls / 1000.0   # CMS
+        base.update(duration_h=dur, storms=[], final_sev=0.0, onset_min=0, ramp_min=0,
+                    bw=dict(onset_min=onset, ramp_min=ramp, hold_min=hold, peak_cms=peak))
+    elif scenario == 6:                     # Blockage Clearance/Recovery, 3-5 d
+        dur = int(r.choice([3 * 24, 4 * 24, 5 * 24]))
+        onset = int(r.integers(12 * 60, 24 * 60))
+        ramp = int(r.choice([0, 240, 480]))            # instant or 4/8 h onset
+        sev = float(r.uniform(0.3, 0.9))
+        hold = int(r.integers(12 * 60, 36 * 60))       # persist before removal
+        clear_ramp = int(r.choice([0, 120, 240, 480]))  # instant clear or self-clearing
+        base.update(duration_h=dur, storms=[], final_sev=sev,
+                    onset_min=onset, ramp_min=ramp,
+                    clear_onset_min=onset + ramp + hold, clear_ramp_min=clear_ramp)
+    elif scenario == 7:                     # Extreme Near-Surcharge Storm, 48-72 h
+        dur = int(r.choice([48, 60, 72]))
+        onset = int(r.integers(20 * 60, 28 * 60))
+        st = sample_storm(r, onset, extreme=True)
+        base.update(duration_h=dur, storms=[st.__dict__],
+                    final_sev=0.0, onset_min=0, ramp_min=0)
     else:
         raise ValueError(scenario)
     return base
@@ -320,7 +373,7 @@ def main():
     ap.add_argument("--target-sort", default="V_p10_dry",
                     help="targets.csv column to rank choke points by (ascending)")
     ap.add_argument("--out", default="data")
-    ap.add_argument("--scenarios", default="1,2,3,4")
+    ap.add_argument("--scenarios", default="1,2,3,4,5,6,7")
     ap.add_argument("--n-per-scenario", type=int, default=5)
     ap.add_argument("--top-k-targets", type=int, default=40)
     ap.add_argument("--k-hops", type=int, default=2)
@@ -333,13 +386,15 @@ def main():
     model = S.InpModel.load(args.inp)
     gages = S.raingage_names(model)
     targets = choke_targets(args.targets, args.top_k_targets, args.target_sort)
+    tdf = pd.read_csv(args.targets)
+    qmax = dict(zip(tdf["conduit"], tdf["Q_max_Ls"])) if "Q_max_Ls" in tdf.columns else {}
     rng = np.random.default_rng(args.seed)
 
     manifest = []
     for sc in [int(x) for x in args.scenarios.split(",")]:
         for ri in range(args.n_per_scenario):
             p = sample_params(sc, ri, rng, targets, gages,
-                              args.report_step, args.routing_step, args.k_hops)
+                              args.report_step, args.routing_step, args.k_hops, qmax)
             print(f"[run] {p['run_id']}  target={p['target']}  "
                   f"sev={p['final_sev']:.2f}  ramp={p['ramp_min']}min  "
                   f"dur={p['duration_h']}h", flush=True)
