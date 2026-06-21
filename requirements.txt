@@ -2,3 +2,4 @@ pyswmm>=2.0
 pandas
 numpy
 pyarrow
+matplotlib
