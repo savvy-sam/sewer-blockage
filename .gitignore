@@ -1,6 +1,9 @@
 data/
+graph_data/
+processed/
 ci_out/
 *.parquet
+*.npz
 *.zip
 __pycache__/
 *.pyc
