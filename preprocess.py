@@ -161,7 +161,7 @@ def load(data_dir: str):
 # Grouped, stratified split + two OOD hold-outs
 # --------------------------------------------------------------------------- #
 def make_splits(meta_runs: pd.DataFrame, seed=0, heldout_node_frac=0.2,
-                n_rain_bins=4, val_frac=0.15, test_frac=0.15):
+                n_rain_bins=4, val_frac=0.15, test_frac=0.15, min_per_split_class=1):
     rng = np.random.default_rng(seed)
     runs = meta_runs.copy()
     runs["split"] = ""
@@ -196,7 +196,43 @@ def make_splits(meta_runs: pd.DataFrame, seed=0, heldout_node_frac=0.2,
         for s, idset in [("test", test), ("val", val), ("train", train)]:
             runs.loc[runs.run_id.isin(idset), "split"] = s
 
+    # --- class-coverage guarantee: ensure val & test each hold >= min runs that
+    #     contain blockage and rainfall, pulling spares from train (OOD untouched) ---
+    flag_cols = [c for c in ("has_blockage", "has_rainfall") if c in runs.columns]
+    for tgt_split in ("val", "test"):
+        for flag in flag_cols:
+            while int(((runs.split == tgt_split) & runs[flag]).sum()) < min_per_split_class:
+                pool = runs[(runs.split == "train") & runs[flag]]
+                if pool.empty:
+                    break                       # can't satisfy from train; caught by guard
+                pick = rng.choice(pool["run_id"].to_numpy())
+                runs.loc[runs.run_id == pick, "split"] = tgt_split
+
     return dict(zip(runs.run_id, runs.split)), runs
+
+
+def assert_class_coverage(table, allow_incomplete=False):
+    """Fail loudly if any in-distribution split (train/val/test) is missing a class
+    that exists in the dataset. OOD sets are exempt (they are deliberate regimes)."""
+    all_classes = set(table["label"].unique())
+    problems = []
+    for s in ("train", "val", "test"):
+        present = set(table.loc[table.split == s, "label"].unique())
+        missing = all_classes - present
+        if table[table.split == s].empty:
+            problems.append(f"split '{s}' is EMPTY")
+        elif missing:
+            problems.append(f"split '{s}' is missing class(es): {sorted(missing)}")
+    if problems:
+        msg = ("SPLIT COVERAGE FAILURE — not every class reaches every in-distribution "
+               "split:\n  - " + "\n  - ".join(problems) +
+               "\n  Fix: generate more runs (esp. blockage scenarios S3/S4/S6) so each "
+               "split can hold each class. Re-run, or pass --allow-incomplete-splits to "
+               "proceed anyway (results will be uninterpretable for the missing class).")
+        if allow_incomplete:
+            print("WARNING: " + msg)
+        else:
+            raise ValueError(msg)
 
 
 # --------------------------------------------------------------------------- #
@@ -307,14 +343,26 @@ def main():
     ap.add_argument("--heldout-node-frac", type=float, default=0.2)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
+    ap.add_argument("--min-split-class", type=int, default=1,
+                    help="min runs containing each of blockage/rainfall in val & test")
+    ap.add_argument("--allow-incomplete-splits", action="store_true",
+                    help="downgrade the class-coverage failure to a warning")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     table, meta_runs = load(args.data)
+    # per-run class presence (computed from the actual labels, not the scenario type)
+    pres = (table.assign(_b=table.label == "blockage", _r=table.label == "rainfall")
+            .groupby("run_id")[["_b", "_r"]].any().rename(
+                columns={"_b": "has_blockage", "_r": "has_rainfall"}))
+    meta_runs = meta_runs.merge(pres, on="run_id", how="left")
+
     split_map, runs_split = make_splits(meta_runs, args.seed, args.heldout_node_frac,
-                                        val_frac=args.val_frac, test_frac=args.test_frac)
+                                        val_frac=args.val_frac, test_frac=args.test_frac,
+                                        min_per_split_class=args.min_split_class)
     table["split"] = table.run_id.map(split_map)
+    assert_class_coverage(table, allow_incomplete=args.allow_incomplete_splits)
     feat_cols = feature_columns(table)
 
     mean, std = fit_scaler(table, feat_cols)              # TRAIN ONLY
