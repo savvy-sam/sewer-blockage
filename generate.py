@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import multiprocessing as mp
 import os
 import shutil
 import tempfile
@@ -366,6 +367,26 @@ def sample_params(scenario: int, run_idx: int, rng, targets: list, gages: list,
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
+# Parallel workers (each run is independent; one model loaded per worker process)
+# --------------------------------------------------------------------------- #
+_WORKER_MODEL = None
+
+
+def _init_worker(inp_path):
+    global _WORKER_MODEL
+    _WORKER_MODEL = S.InpModel.load(inp_path)
+
+
+def _run_job(job):
+    params, inp_path, out_dir = job
+    try:
+        return run_one(_WORKER_MODEL, inp_path, params, out_dir)
+    except Exception as e:                                # keep the batch alive
+        return {"run_id": params["run_id"], "scenario": params["scenario"],
+                "error": f"{type(e).__name__}: {e}"}
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inp", required=True)
@@ -379,6 +400,9 @@ def main():
     ap.add_argument("--k-hops", type=int, default=2)
     ap.add_argument("--report-step", type=int, default=60)
     ap.add_argument("--routing-step", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel processes; 0 = auto (use all CPU cores), "
+                         "1 = serial (default). Never exceeds the number of runs.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -390,22 +414,46 @@ def main():
     qmax = dict(zip(tdf["conduit"], tdf["Q_max_Ls"])) if "Q_max_Ls" in tdf.columns else {}
     rng = np.random.default_rng(args.seed)
 
+    # Build the full param list first, sequentially: the RNG draw order (and hence
+    # which runs are produced) is identical regardless of --workers, so parallelism
+    # never changes WHAT is generated, only how fast.
+    jobs = [sample_params(sc, ri, rng, targets, gages, args.report_step,
+                          args.routing_step, args.k_hops, qmax)
+            for sc in [int(x) for x in args.scenarios.split(",")]
+            for ri in range(args.n_per_scenario)]
+
+    # choose worker count: --workers 0 (or negative) -> use all CPU cores;
+    # never spawn more workers than there are runs.
+    workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+    workers = max(1, min(workers, len(jobs)))
+
     manifest = []
-    for sc in [int(x) for x in args.scenarios.split(",")]:
-        for ri in range(args.n_per_scenario):
-            p = sample_params(sc, ri, rng, targets, gages,
-                              args.report_step, args.routing_step, args.k_hops, qmax)
+
+    def record(row):
+        manifest.append(row)
+        pd.DataFrame(manifest).sort_values("run_id").to_csv(
+            os.path.join(args.out, "manifest.csv"), index=False)
+
+    if workers > 1:
+        print(f"running {len(jobs)} simulations on {workers} workers "
+              f"(detected {os.cpu_count()} cores) ...", flush=True)
+        payload = [(p, args.inp, args.out) for p in jobs]
+        with mp.Pool(workers, initializer=_init_worker, initargs=(args.inp,)) as pool:
+            for row in pool.imap_unordered(_run_job, payload):
+                tag = row.get("error") or f"ok ({row.get('n_rows', '?')} rows)"
+                print(f"[done] {row['run_id']}  {tag}", flush=True)
+                record(row)
+    else:
+        for p in jobs:
             print(f"[run] {p['run_id']}  target={p['target']}  "
                   f"sev={p['final_sev']:.2f}  ramp={p['ramp_min']}min  "
                   f"dur={p['duration_h']}h", flush=True)
             try:
-                manifest.append(run_one(model, args.inp, p, args.out))
+                record(run_one(model, args.inp, p, args.out))
             except Exception as e:                       # keep the batch alive
                 print(f"   !! failed: {type(e).__name__}: {e}", flush=True)
-                manifest.append({"run_id": p["run_id"], "scenario": f"S{sc}",
-                                 "error": f"{type(e).__name__}: {e}"})
-            pd.DataFrame(manifest).to_csv(os.path.join(args.out, "manifest.csv"),
-                                          index=False)
+                record({"run_id": p["run_id"], "scenario": p["scenario"],
+                        "error": f"{type(e).__name__}: {e}"})
     print(f"done -> {args.out}/manifest.csv  ({len(manifest)} runs)")
 
 
