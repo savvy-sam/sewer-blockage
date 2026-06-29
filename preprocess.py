@@ -49,80 +49,88 @@ FORBIDDEN = {"gt_severity", "gt_setting", "ctx_antecedent_dry_days",
 # --------------------------------------------------------------------------- #
 # Per-run feature construction (causal; consistent columns across runs)
 # --------------------------------------------------------------------------- #
-def build_run_features(df: pd.DataFrame, roll: int = 15, diff_lags=(1, 5)) -> pd.DataFrame:
+def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> pd.DataFrame:
+    """Per-run causal features, emphasising BASELINE-RELATIVE (pipe-invariant)
+    quantities. Absolute depth/flow magnitudes differ enormously between a big
+    trunk sewer and a small lateral, so a model trained on them overfits to the
+    training pipes and fails on held-out ones. Here depth/flow/velocity/shear are
+    expressed as FRACTIONAL anomalies vs each run's own causal trailing baseline
+    (rolling median over `base` minutes), so the blockage signature (depth up,
+    flow down) is comparable across sensor locations. Raw absolute magnitudes are
+    NOT emitted. Only dimensionless quantities (fill ratio, Froude), rainfall, the
+    depth-to-flow ratio, dropout flags, and relative anomalies/rates survive."""
     df = df.sort_values("t_min").reset_index(drop=True)
     tgt = df["target_conduit"].iloc[0]
-    n = len(df)
     out = pd.DataFrame(index=df.index)
 
-    def pick(base):  # prefer the measured (noisy) channel where it exists
-        m = base + "_meas"
+    def pick(b):                                  # prefer the measured (noisy) channel
+        m = b + "_meas"
         if m in df.columns:
             return df[m]
-        return df[base] if base in df.columns else pd.Series(np.nan, index=df.index)
+        return df[b] if b in df.columns else pd.Series(np.nan, index=df.index)
 
-    # primary conduit (the deployed flow-meter location)
-    out["p_flow"] = pick(f"flow__{tgt}")
-    out["p_depth"] = df.get(f"depth__{tgt}", pd.Series(np.nan, index=df.index))
-    out["p_vel"] = pick(f"vel__{tgt}")
-    out["p_ushear"] = pick(f"ushear__{tgt}")
-    out["p_fill"] = df.get(f"fill__{tgt}", pd.Series(np.nan, index=df.index))
-    out["p_froude"] = df.get(f"froude__{tgt}", pd.Series(np.nan, index=df.index))
+    def rel(series):                              # fractional anomaly vs causal baseline
+        s = series.astype(float)
+        b = s.rolling(base, min_periods=1).median()
+        return (s - b) / (b.abs() + EPS)
 
-    # primary node depth (ultrasonic sensor); recover node id from the _meas column
+    # raw primary channels (used to DERIVE relative features; not emitted raw)
+    flow = pick(f"flow__{tgt}").ffill()
+    vel = pick(f"vel__{tgt}").ffill()
+    ushear = pick(f"ushear__{tgt}").ffill()
     node_meas = [c for c in df.columns if c.startswith("depth__node_") and c.endswith("_meas")]
     if node_meas:
-        out["p_node_depth"] = df[node_meas[0]]
+        node_depth = df[node_meas[0]].ffill()
         prim_node_base = node_meas[0][:-5]
     else:
         ncols = [c for c in df.columns if c.startswith("depth__node_")]
-        out["p_node_depth"] = df[ncols[0]] if ncols else pd.Series(np.nan, index=df.index)
+        node_depth = df[ncols[0]].ffill() if ncols else pd.Series(np.nan, index=df.index)
         prim_node_base = ncols[0] if ncols else None
+    dtf = node_depth / (flow.abs() + EPS)
 
-    # neighbour aggregates (spatial context, order-independent so it's run-consistent)
+    # --- baseline-relative (pipe-invariant) primary features ---
+    out["depth_rel"] = rel(node_depth)            # depth rise vs its own baseline
+    out["flow_rel"] = rel(flow)                   # flow drop vs its own baseline
+    out["vel_rel"] = rel(vel)
+    out["ushear_rel"] = rel(ushear)
+    out["dtf_rel"] = rel(dtf)
+    out["dtf_ratio"] = dtf                        # depth-to-flow ratio (only weakly pipe-dependent)
+
+    # --- dimensionless quantities (already location-invariant) ---
+    out["p_fill"] = df.get(f"fill__{tgt}", pd.Series(0.0, index=df.index))
+    out["p_froude"] = df.get(f"froude__{tgt}", pd.Series(0.0, index=df.index))
+
+    # --- spatial context as RELATIVE neighbour anomalies (not absolute magnitudes) ---
     nb_depth = [c for c in df.columns if c.startswith("depth__") and
                 not c.startswith("depth__node_") and c != f"depth__{tgt}"]
     nb_flow = [c for c in df.columns if c.startswith("flow__") and c != f"flow__{tgt}"
                and not c.endswith(("_meas", "_missing"))]
-    nb_vel = [c for c in df.columns if c.startswith("vel__") and c != f"vel__{tgt}"
-              and not c.endswith(("_meas", "_missing"))]
-    out["nb_depth_mean"] = df[nb_depth].mean(axis=1) if nb_depth else 0.0
-    out["nb_depth_max"] = df[nb_depth].max(axis=1) if nb_depth else 0.0
-    out["nb_flow_mean"] = df[nb_flow].mean(axis=1) if nb_flow else 0.0
-    out["nb_vel_mean"] = df[nb_vel].mean(axis=1) if nb_vel else 0.0
-    node_all = [c for c in df.columns if c.startswith("depth__node_")
-                and not c.endswith(("_meas", "_missing"))]
-    out["node_depth_spread"] = (df[node_all].max(axis=1) - df[node_all].min(axis=1)
-                                if node_all else 0.0)
+    out["nb_depth_rel_mean"] = (pd.concat([rel(df[c]) for c in nb_depth], axis=1).mean(axis=1)
+                                if nb_depth else 0.0)
+    out["nb_flow_rel_mean"] = (pd.concat([rel(df[c]) for c in nb_flow], axis=1).mean(axis=1)
+                               if nb_flow else 0.0)
 
-    # rainfall (gauge — allowed observable)
+    # --- relative rate-of-change (fractional change vs baseline; captures onset) ---
+    base_depth = node_depth.rolling(base, min_periods=1).median().abs() + EPS
+    base_flow = flow.rolling(base, min_periods=1).median().abs() + EPS
+    for lag in diff_lags:
+        out[f"ddepth_{lag}"] = node_depth.diff(lag) / base_depth
+        out[f"dflow_{lag}"] = flow.diff(lag) / base_flow
+
+    # --- rainfall (location-independent forcing) ---
     for g in RAIN_GAGES:
         out[f"rain_{g}"] = df.get(f"rain__{g}", 0.0)
     out["rain_mean"] = out[[f"rain_{g}" for g in RAIN_GAGES]].mean(axis=1)
 
-    # dropout / missing-data indicator flags (these ARE features)
-    for base, flag in [(f"flow__{tgt}", "p_flow_missing"), (f"vel__{tgt}", "p_vel_missing"),
-                       (f"ushear__{tgt}", "p_ushear_missing")]:
-        out[flag] = df[base + "_missing"] if base + "_missing" in df.columns else 0
+    # --- dropout indicator flags (these ARE features) ---
+    for b, flag in [(f"flow__{tgt}", "p_flow_missing"), (f"vel__{tgt}", "p_vel_missing"),
+                    (f"ushear__{tgt}", "p_ushear_missing")]:
+        out[flag] = df[b + "_missing"] if b + "_missing" in df.columns else 0
     out["p_node_depth_missing"] = (df[prim_node_base + "_missing"]
                                    if prim_node_base and prim_node_base + "_missing" in df.columns
                                    else 0)
 
-    # causal forward-fill of the physical sensor channels (sensor holds last reading)
-    sensor = ["p_flow", "p_vel", "p_ushear", "p_node_depth"]
-    out[sensor] = out[sensor].ffill()
-
-    # engineered features (all causal: use current row + its own past only)
-    out["dtf_ratio"] = out["p_node_depth"] / (out["p_flow"].abs() + EPS)   # core feature
-    for lag in diff_lags:
-        out[f"d{lag}_node_depth"] = out["p_node_depth"].diff(lag)
-        out[f"d{lag}_flow"] = out["p_flow"].diff(lag)
-        out[f"d{lag}_ushear"] = out["p_ushear"].diff(lag)
-    out["roll_mean_depth"] = out["p_node_depth"].rolling(roll, min_periods=1).mean()
-    out["roll_std_depth"] = out["p_node_depth"].rolling(roll, min_periods=1).std()
-    out["roll_mean_flow"] = out["p_flow"].rolling(roll, min_periods=1).mean()
-
-    out = out.fillna(0.0)
+    out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
     # metadata for splitting / audit (NOT features)
     out["label_id"] = df["label_id"].values
@@ -142,14 +150,14 @@ def feature_columns(table: pd.DataFrame) -> list:
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-def load(data_dir: str):
+def load(data_dir: str, base: int = 240):
     files = sorted(glob.glob(os.path.join(data_dir, "runs", "*.parquet")))
     if not files:
         raise FileNotFoundError(f"no parquet under {data_dir}/runs/")
     feats, meta_rows = [], []
     for f in files:
         df = pd.read_parquet(f)
-        feats.append(build_run_features(df))
+        feats.append(build_run_features(df, base=base))
         rain_cols = [c for c in df.columns if c.startswith("rain__")]
         total_rain = float(df[rain_cols].to_numpy().sum()) if rain_cols else 0.0
         meta_rows.append(dict(run_id=df["run_id"].iloc[0], scenario=df["scenario"].iloc[0],
@@ -339,7 +347,9 @@ def main():
     ap.add_argument("--out", default="processed")
     ap.add_argument("--window", type=int, default=60)
     ap.add_argument("--stride", type=int, default=10)
-    ap.add_argument("--roll", type=int, default=15)
+    ap.add_argument("--baseline-min", type=int, default=240,
+                    help="trailing-window minutes for the per-run causal baseline "
+                         "used by the relative anomaly features")
     ap.add_argument("--heldout-node-frac", type=float, default=0.2)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
@@ -351,7 +361,7 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    table, meta_runs = load(args.data)
+    table, meta_runs = load(args.data, args.baseline_min)
     # per-run class presence (computed from the actual labels, not the scenario type)
     pres = (table.assign(_b=table.label == "blockage", _r=table.label == "rainfall")
             .groupby("run_id")[["_b", "_r"]].any().rename(
