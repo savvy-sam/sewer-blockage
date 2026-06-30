@@ -95,6 +95,10 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
     out["ushear_rel"] = rel(ushear)
     out["dtf_rel"] = rel(dtf)
     out["dtf_ratio"] = dtf                        # depth-to-flow ratio (only weakly pipe-dependent)
+    # blockage signature: large only when depth RISES while flow FALLS. A storm raises
+    # BOTH depth and flow, so this stays near zero for rain — the one signal rain does
+    # not share (blockage: depth_rel>0, flow_rel<0 -> big; rain: both >0 -> cancels).
+    out["blk_sig"] = out["depth_rel"] - out["flow_rel"]
 
     # --- dimensionless quantities (already location-invariant) ---
     out["p_fill"] = df.get(f"fill__{tgt}", pd.Series(0.0, index=df.index))
@@ -353,6 +357,9 @@ def main():
     ap.add_argument("--heldout-node-frac", type=float, default=0.2)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
+    ap.add_argument("--min-clear-severity", type=float, default=0.0,
+                    help="drop blockage rows with gt_severity below this (excludes weak "
+                         "early-ramp timesteps that look normal; 0 = keep all)")
     ap.add_argument("--min-split-class", type=int, default=1,
                     help="min runs containing each of blockage/rainfall in val & test")
     ap.add_argument("--allow-incomplete-splits", action="store_true",
@@ -372,6 +379,14 @@ def main():
                                         val_frac=args.val_frac, test_frac=args.test_frac,
                                         min_per_split_class=args.min_split_class)
     table["split"] = table.run_id.map(split_map)
+
+    # optional label-dilution test: drop weak early-ramp blockage rows (no real signal)
+    if args.min_clear_severity > 0 and "gt_severity" in table.columns:
+        ambig = (table["label"] == "blockage") & (table["gt_severity"] < args.min_clear_severity)
+        print(f"excluding {int(ambig.sum())} low-severity blockage rows "
+              f"(gt_severity < {args.min_clear_severity})")
+        table = table[~ambig].reset_index(drop=True)
+
     assert_class_coverage(table, allow_incomplete=args.allow_incomplete_splits)
     feat_cols = feature_columns(table)
 
