@@ -1,0 +1,24 @@
+
+  EPA STORM WATER MANAGEMENT MODEL - VERSION 5.2 (Build 5.2.4)
+  PYSWMM TOOLKIT API - VERSION v1.0 (2026-02-26)
+  ------------------------------------------------------------
+
+  WARNING 04: minimum elevation drop used for Conduit G60F090_G60F070_l1
+  WARNING 04: minimum elevation drop used for Conduit G61F060_G61F140_l1
+  WARNING 04: minimum elevation drop used for Conduit G62F012_G62F011_l1
+  WARNING 04: minimum elevation drop used for Conduit G70F301_G70F11P_l1
+  WARNING 04: minimum elevation drop used for Conduit G70F301_G70F11P_l2
+  WARNING 04: minimum elevation drop used for Conduit G71F290_G71F280_l1
+  WARNING 04: minimum elevation drop used for Conduit G71R050_G71U10F_l1
+  WARNING 04: minimum elevation drop used for Conduit G72K875_G72F874_l1
+  WARNING 04: minimum elevation drop used for Conduit G73F340_G73F330_l1
+  WARNING 04: minimum elevation drop used for Conduit G76R180_G76R185_l1
+  WARNING 10: crest elevation raised to downstream invert for regulator Link G60F61Yo1
+  WARNING 02: maximum depth increased for Node G60K200
+  WARNING 02: maximum depth increased for Node G60K210
+  WARNING 02: maximum depth increased for Node G60U01F
+  WARNING 02: maximum depth increased for Node G72K020
+
+  Analysis begun on:  Wed Jul  1 09:39:51 2026
+  Analysis ended on:  Wed Jul  1 09:39:51 2026
+  Total elapsed time: < 1 sec

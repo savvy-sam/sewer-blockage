@@ -64,6 +64,22 @@ RAIN_BIN_MIN = 30                # time-of-day bin (min) for the diurnal dry bas
 LABELS = {"normal": 0, "rainfall": 1, "blockage": 2}
 BASE_START = dt.datetime(2012, 6, 29, 0, 1)   # arbitrary dry anchor in the model calendar
 
+# --- blockage mechanism: runtime flow_limit cap on the real target conduit ---
+# (replaces the inline orifice, which trapped backwater at the injected node; see
+#  Findings.md F7. cap = (1 - severity) * Q_ref, Q_ref = a percentile of the pipe's
+#  own pre-onset no-blockage flow so severity bites proportionally to actual flow.)
+Q_REF_PCT = 75.0                 # percentile of pre-onset no-blockage flow used as Q_ref
+WARMUP_MIN = 120                 # skip this warm-up window (network fills from empty) for Q_ref
+
+# --- Approach 1: observability-gated labels (label_obs), computed from paired
+#     counterfactual twins vs the physical sensor visibility floor (Findings.md F8) ---
+OBS_K_SIGMA = 3.0                # a change < k*sigma of the sensor is invisible
+OBS_TAU_ABS_M = 0.01             # absolute depth floor (m) a level sensor can resolve
+OBS_SUSTAIN_MIN = 5              # effect must exceed the floor for >= this many minutes
+DEFAULT_LABEL_SCHEME = "obs_and" # which variant populates `label`/`label_id`
+                                 # (cause | obs_or | obs_and); ALL are always written so
+                                 # OR vs AND (and cause) can be A/B-compared without regen.
+
 
 # --------------------------------------------------------------------------- #
 # Sensor network selection
@@ -85,10 +101,16 @@ def select_sensor_conduits(model: S.InpModel, target: str, k_hops: int = 2) -> l
                     seen_nodes.add(nb)
                     nxt.add(nb)
         frontier = nxt
-    # keep only conduits we have a diameter for (circular)
+    # keep conduits with a circular diameter (needed for channel features), but
+    # ALWAYS keep the target conduit even if non-circular (bug fix: it was silently
+    # dropped when non-circular, so the target's own channel was never recorded).
     diam = model.xsection_diam()
-    return [c for c in sorted(sensor_conduits)
-            if diam.get(c, {}).get("shape") == "CIRCULAR" and diam[c]["geom1"] > 0]
+    keep = [c for c in sorted(sensor_conduits)
+            if c == target or (diam.get(c, {}).get("shape") == "CIRCULAR"
+                               and diam.get(c, {}).get("geom1", 0) > 0)]
+    if target not in keep:
+        keep.insert(0, target)
+    return keep
 
 
 # --------------------------------------------------------------------------- #
@@ -147,118 +169,273 @@ def rainfall_response_mask(depth, tod_min, intensity, blk_mask,
     return storm_started & excess & (~blk_mask)
 
 
+def _sustained(mask, m):
+    """True where `mask` has been True for >= m consecutive samples (incl. current)."""
+    mask = np.asarray(mask, dtype=bool)
+    if m <= 1:
+        return mask
+    run = np.zeros(len(mask), dtype=int)
+    c = 0
+    for i, v in enumerate(mask):
+        c = c + 1 if v else 0
+        run[i] = c
+    return run >= m
+
+
+def _simulate(inp_path, sensor_conduits, sensor_nodes, diam, rough,
+              gages, gage_series, n_min, control=None):
+    """Run one SWMM simulation and return a clean (pre-realism) per-minute DataFrame.
+    `control(i, links)` is called each step (used to set the target's flow_limit)."""
+    rows = []
+    with Simulation(inp_path) as sim:
+        links, nodes = Links(sim), Nodes(sim)
+        sim.step_advance(60)
+        i = 0
+        for _ in sim:
+            if control is not None:
+                control(i, links)
+            row = {"t_min": i,
+                   "timestamp": (BASE_START + dt.timedelta(minutes=i)).isoformat()}
+            for c in sensor_conduits:
+                lk = links[c]
+                if c in diam and diam[c].get("geom1", 0) > 0:
+                    feat = channel_features(lk.flow, lk.ds_xsection_area, lk.depth,
+                                            diam[c]["geom1"], rough[c])
+                    for k, v in feat.items():
+                        row[f"{k}__{c}"] = v
+                else:                       # non-circular target: raw flow/depth only
+                    row[f"flow__{c}"] = lk.flow
+                    row[f"depth__{c}"] = lk.depth
+            for nd in sensor_nodes:
+                row[f"depth__node_{nd}"] = nodes[nd].depth
+            for g in gages:
+                row[f"rain__{g}"] = gage_series[g][min(i, n_min - 1)]
+            rows.append(row)
+            i += 1
+            if i >= n_min:
+                break
+    return pd.DataFrame(rows)
+
+
+def _sensor_sigma(clean, realism_params, col):
+    """Effective sensor noise sigma (m) for a depth column: additive noise +
+    quantisation, from the realism model applied to that column."""
+    p = realism_params.get(col)
+    if not p:
+        return 0.0
+    x = np.asarray(clean, dtype=float)
+    rms = float(np.sqrt(np.nanmean(x * x))) if len(x) else 0.0
+    sig_noise = rms * (10.0 ** (-p.get("snr_db", 60.0) / 20.0))
+    res = p.get("resolution", 0.0)
+    return float(np.sqrt(sig_noise ** 2 + (res ** 2) / 12.0))
+
+
 # --------------------------------------------------------------------------- #
 # Single run
 # --------------------------------------------------------------------------- #
 def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: str) -> dict:
-    """Execute one simulation, label it, write parquet, return a manifest row."""
+    """Execute the observed run + counterfactual twins, label (cause & observability),
+    write parquet, return a manifest row.
+
+    Blockage mechanism: runtime `flow_limit` cap on the real target conduit (no orifice).
+    Twins (identical seed/window; one factor toggled) give the clean causal effect used
+    for the observability-gated label (Findings.md F8):
+      * dry   : no rain,  no blockage  -> baseline
+      * noblk : rain on,  no blockage  -> isolates rain (dry_delta) + gives Q_ref
+      * main  : rain on,  blockage cap -> isolates blockage (vs noblk); the observed run
+    """
     rng = np.random.default_rng(params["seed"])
     n_min = params["duration_h"] * 60
     start = BASE_START
     end = start + dt.timedelta(minutes=n_min)
+    target = params["target"]
+    conduits = base_model.conduits()
+    tc = conduits[target]
+    n1, n2 = tc["n1"], tc["n2"]
 
-    # --- inject blockage orifice (held open if final_sev == 0) ---
-    text, blk = S.inject_inline_orifice(base_model, params["target"])
-    text = S.set_simulation_window(text, start, end,
-                                   report_step_s=params["report_step_s"],
-                                   routing_step_s=params["routing_step_s"])
+    # --- sensor set ---
+    sensor_conduits = select_sensor_conduits(base_model, target, k_hops=params["k_hops"])
+    # downstream conduit (starts at the target's outlet node): its flow is the
+    # EMERGENT flow response to the blockage (drops as less water gets through), so
+    # it — not the capped target flow — is the non-circular flow feature source (F8).
+    # Ensure it is recorded even if select_sensor_conduits didn't pick it up.
+    downstream = next((c for c in sensor_conduits if conduits[c]["n1"] == n2),
+                      next((c for c, d in conduits.items() if d["n1"] == n2), ""))
+    if downstream and downstream not in sensor_conduits:
+        sensor_conduits = sensor_conduits + [downstream]
+    diam = base_model.xsection_diam()
+    rough = {c["name"]: c["rough"] for c in conduits.values()}
+    sensor_nodes = sorted({conduits[c]["n1"] for c in sensor_conduits} |
+                          {conduits[c]["n2"] for c in sensor_conduits})
+    sensor_node = n1                       # upstream manhole = primary detection sensor
 
-    # --- rainfall ---
+    # --- rainfall series ---
     gages = S.raingage_names(base_model)
     storms = [Storm(**s) for s in params["storms"]]
     basin_series = build_intensity_series(n_min, storms)
     mults = params["gage_mults"]
     gage_series = {g: basin_series * mults.get(g, 1.0) for g in gages}
-    rundir = tempfile.mkdtemp(prefix="swmmrun_")
-    dat_name = "rain_run.dat"
-    write_rain_dat(os.path.join(rundir, dat_name), start, gage_series)
-    text = S.set_rain_file(text, dat_name)
+    zero_series = {g: np.zeros(n_min) for g in gages}
+    has_rain = float(basin_series.sum()) > 0
+    has_blk = params["final_sev"] > 0
 
-    # --- non-blockage backwater (Scenario 5): transient downstream inflow surge ---
+    # --- base text (no orifice) + window + optional downstream backwater surge ---
+    rundir = tempfile.mkdtemp(prefix="swmmrun_")
+    base_text = S.set_simulation_window(base_model.text, start, end,
+                                        report_step_s=params["report_step_s"],
+                                        routing_step_s=params["routing_step_s"])
     if params.get("bw"):
         bw = params["bw"]
         o, rmp, hold, pk = bw["onset_min"], bw["ramp_min"], bw["hold_min"], bw["peak_cms"]
         bps = [(0, 0.0), (o, 0.0), (o + rmp, pk), (o + rmp + hold, pk),
                (o + rmp + hold + rmp, 0.0), (n_min, 0.0)]
-        text = S.add_inflow_surge(text, blk.n2, f"BW_{params['target']}", bps, start)
+        base_text = S.add_inflow_surge(base_text, n2, f"BW_{target}", bps, start)
 
-    inp_path = os.path.join(rundir, "run.inp")
-    with open(inp_path, "w") as fh:
-        fh.write(text)
+    def _write_inp(series, name):
+        write_rain_dat(os.path.join(rundir, name + ".dat"), start, series)
+        t = S.set_rain_file(base_text, name + ".dat")
+        p = os.path.join(rundir, name + ".inp")
+        with open(p, "w") as fh:
+            fh.write(t)
+        return p
+    inp_rain = _write_inp(gage_series, "rain_on")
+    inp_dry = _write_inp(zero_series, "rain_off") if has_rain else inp_rain
 
-    # --- sensor set ---
-    sensor_conduits = select_sensor_conduits(base_model, params["target"],
-                                             k_hops=params["k_hops"])
-    diam = base_model.xsection_diam()
-    rough = {c["name"]: c["rough"] for c in base_model.conduits().values()}
-    sensor_nodes = sorted({base_model.conduits()[c]["n1"] for c in sensor_conduits} |
-                          {base_model.conduits()[c]["n2"] for c in sensor_conduits})
+    def _sim(inp_path, series, control=None):
+        return _simulate(inp_path, sensor_conduits, sensor_nodes, diam, rough,
+                         gages, series, n_min, control=control)
 
-    # --- simulate, sampling at 1-min ---
-    rows = []
-    severities = []
-    with Simulation(inp_path) as sim:
-        links, nodes = Links(sim), Nodes(sim)
-        orf = links[blk.orifice_name]
-        sim.step_advance(60)
-        i = 0
-        for _ in sim:
-            t_min = i
-            sev = severity_at(t_min, params["onset_min"], params["ramp_min"],
-                              params["final_sev"],
-                              params.get("clear_onset_min"),
-                              params.get("clear_ramp_min", 0))
-            orf.target_setting = S.severity_to_setting(sev)
-            severities.append(sev)
-            row = {"t_min": t_min,
-                   "timestamp": (start + dt.timedelta(minutes=t_min)).isoformat()}
-            for c in sensor_conduits:
-                lk = links[c]
-                feat = channel_features(lk.flow, lk.ds_xsection_area, lk.depth,
-                                        diam[c]["geom1"], rough[c])
-                for k, v in feat.items():
-                    row[f"{k}__{c}"] = v
-            for nd in sensor_nodes:
-                row[f"depth__node_{nd}"] = nodes[nd].depth
-            for g in gages:
-                row[f"rain__{g}"] = gage_series[g][min(t_min, n_min - 1)]
-            rows.append(row)
-            i += 1
-            if i >= n_min:
-                break
+    # --- pass 1: dry, no-blockage baseline ---
+    df_dry = _sim(inp_dry, zero_series)
+    # --- pass 2: rain-on, no-blockage (rain isolation + Q_ref) ---
+    df_noblk = _sim(inp_rain, gage_series) if has_rain else df_dry
 
-    df = pd.DataFrame(rows)
-    severities = np.array(severities[:len(df)])
-    intensity = basin_series[:len(df)]
+    # --- Q_ref: percentile of the pipe's own pre-onset no-blockage flow, skipping
+    #     the warm-up (empty-network fill). Falls back to the whole post-warm-up run
+    #     if the pre-onset window is too short / all warm-up (else q_ref would be 0
+    #     and the cap would silently do nothing). ---
+    fcol = f"flow__{target}"
+    base_flow = np.abs(df_noblk[fcol].to_numpy(dtype=float))
+    warm = min(WARMUP_MIN, params["onset_min"])
+    hi = params["onset_min"] if params["onset_min"] > warm else len(base_flow)
+    win = base_flow[warm:hi]
+    win = win[np.isfinite(win)]
+    q_ref = float(np.percentile(win, Q_REF_PCT)) if len(win) else 0.0
+    if q_ref <= 1e-9:                                    # fallback: whole post-warm-up run
+        alt = base_flow[WARMUP_MIN:]
+        alt = alt[np.isfinite(alt)]
+        q_ref = float(np.percentile(alt, Q_REF_PCT)) if len(alt) else 0.0
 
-    # --- labels (priority blockage > rainfall > normal) ---
-    # rainfall is a *response-based* label: depth must rise above its diurnal
-    # dry-weather baseline during/after rain (not merely "it is raining").
-    blk_mask = severities >= ONSET_SEVERITY
+    # --- severity schedule + pass 3: observed run with flow_limit cap ---
+    severities = np.array([severity_at(i, params["onset_min"], params["ramp_min"],
+                                       params["final_sev"], params.get("clear_onset_min"),
+                                       params.get("clear_ramp_min", 0))
+                           for i in range(n_min)])
+
+    def _cap(i, links):
+        s = severities[i] if i < len(severities) else 0.0
+        links[target].flow_limit = (1.0 - s) * q_ref if (s > 0 and q_ref > 0) else 0.0
+
+    df = _sim(inp_rain, gage_series, control=_cap) if has_blk else df_noblk
+
+    m = min(len(df), len(df_noblk), len(df_dry), n_min)
+    df = df.iloc[:m].reset_index(drop=True)
+    severities = severities[:m]
+    intensity = basin_series[:m]
+    ncol = f"depth__node_{sensor_node}"
+
+    # ================= LABEL A: cause-based (intervention active) ==================
+    blk_cause = severities >= ONSET_SEVERITY
     start_tod = BASE_START.hour * 60 + BASE_START.minute
-    tod_min = (start_tod + np.arange(len(df))) % 1440
-    sensor_depth = df[f"depth__node_{blk.n1}"].to_numpy(dtype=float)
-    rain_mask = rainfall_response_mask(sensor_depth, tod_min, intensity, blk_mask,
-                                       RAIN_REL_MARGIN, RAIN_ABS_MARGIN_M, RAIN_BIN_MIN)
-    label = np.where(blk_mask, "blockage", np.where(rain_mask, "rainfall", "normal"))
-    df["label"] = label
-    df["label_id"] = [LABELS[x] for x in label]
+    tod_min = (start_tod + np.arange(m)) % 1440
+    sensor_depth = df[ncol].to_numpy(dtype=float)
+    rain_cause = rainfall_response_mask(sensor_depth, tod_min, intensity, blk_cause,
+                                        RAIN_REL_MARGIN, RAIN_ABS_MARGIN_M, RAIN_BIN_MIN)
+    label_cause = np.where(blk_cause, "blockage",
+                           np.where(rain_cause, "rainfall", "normal"))
 
-    # --- ground-truth / context columns (not features unless noted) ---
+    # --- context / ground truth (not features) ---
     df["gt_severity"] = severities
-    df["gt_setting"] = [S.severity_to_setting(s) for s in severities]
+    df["gt_flow_limit"] = np.where((severities > 0) & (q_ref > 0),
+                                   (1.0 - severities) * q_ref, np.nan)
+    df["gt_q_ref"] = q_ref
     df["ctx_antecedent_dry_days"] = params["antecedent_dry_days"]
     df["ctx_antecedent_precip_index"] = params["antecedent_precip_index"]
     df["scenario"] = params["scenario"]
     df["run_id"] = params["run_id"]
-    df["target_conduit"] = params["target"]
+    df["target_conduit"] = target
+    df["ctx_downstream_conduit"] = downstream
 
-    # --- sensor-realism on the two physical sensors (depth + flow/velocity) ---
-    primary = params["target"]
-    realism_cols = [f"depth__node_{blk.n1}", f"flow__{primary}", f"vel__{primary}",
-                    f"ushear__{primary}"]
+    # --- sensor realism: upstream depth gauge + DOWNSTREAM flow meter (the real
+    #     instrument locations; the target's own flow is the imposed knob, not sensed) ---
+    fsrc = downstream if downstream else target
+    realism_cols = [ncol, f"flow__{fsrc}", f"vel__{fsrc}", f"ushear__{fsrc}"]
     realism_cols = [c for c in realism_cols if c in df.columns]
+    clean_depth = df[ncol].to_numpy(dtype=float).copy()
+    clean_flow_ds = (df[f"flow__{downstream}"].to_numpy(dtype=float).copy()
+                     if downstream and f"flow__{downstream}" in df.columns else None)
     df, realism_params = apply_realism(df, realism_cols, rng)
+
+    # ============ LABEL B: observability-gated (counterfactual Δ vs sensor floor) ====
+    # "What a sensor can see" = an ABSOLUTE physical change at a real instrument that
+    # exceeds that instrument's own ABSOLUTE noise floor (NOT a relative/normalised
+    # value), on the CLEAN pre-noise signal from the counterfactual twins. A moment is
+    # visible if EITHER the upstream depth gauge OR the downstream flow meter moves
+    # beyond its floor, sustained. (The target's own flow is the imposed knob and is
+    # never used here; the downstream flow is the emergent response.)
+    d_full = df[ncol].to_numpy(dtype=float)                      # blocked + rain (clean)
+    d_noblk = df_noblk[ncol].to_numpy(dtype=float)[:m]           # rain, no blockage
+    d_dry = df_dry[ncol].to_numpy(dtype=float)[:m]               # no rain, no blockage
+    delta_blk = d_full - d_noblk                                 # blockage effect on DEPTH (m)
+    delta_rain = d_noblk - d_dry                                 # rain effect on DEPTH (m)
+    tau_d = max(OBS_TAU_ABS_M, OBS_K_SIGMA * _sensor_sigma(clean_depth, realism_params, ncol))
+    dep_blk = np.abs(delta_blk) >= tau_d
+    dep_rain = np.abs(delta_rain) >= tau_d
+
+    # downstream FLOW meter — absolute m3/s vs the flow sensor's own absolute noise floor
+    delta_blk_f = np.zeros(m); delta_rain_f = np.zeros(m); tau_f = float("inf")
+    fcol_ds = f"flow__{downstream}" if downstream else ""
+    if fcol_ds and fcol_ds in df.columns and fcol_ds in df_noblk.columns and clean_flow_ds is not None:
+        f_full = df[fcol_ds].to_numpy(dtype=float)
+        f_noblk = df_noblk[fcol_ds].to_numpy(dtype=float)[:m]
+        f_dry = (df_dry[fcol_ds].to_numpy(dtype=float)[:m] if fcol_ds in df_dry.columns else f_noblk)
+        delta_blk_f = f_full - f_noblk
+        delta_rain_f = f_noblk - f_dry
+        sig_f = _sensor_sigma(clean_flow_ds, realism_params, fcol_ds)
+        tau_f = OBS_K_SIGMA * sig_f if sig_f > 0 else float("inf")
+    flo_blk = np.abs(delta_blk_f) >= tau_f
+    flo_rain = np.abs(delta_rain_f) >= tau_f
+
+    # Compute BOTH combination rules so OR vs AND can be A/B-compared:
+    #   OR  = either sensor suffices (earlier onset, higher coverage)
+    #   AND = agreement — both the upstream depth AND the downstream flow must show it
+    #         (higher confidence; onset set by the slower sensor — apt since a real
+    #         blockage is rarely sudden). Falls back to depth-only w/o a flow sensor.
+    have_flow = np.isfinite(tau_f)
+    blk_or = _sustained(dep_blk | flo_blk, OBS_SUSTAIN_MIN)
+    rain_or = _sustained(dep_rain | flo_rain, OBS_SUSTAIN_MIN)
+    if have_flow:
+        blk_and = _sustained(dep_blk & flo_blk, OBS_SUSTAIN_MIN)
+        rain_and = _sustained(dep_rain & flo_rain, OBS_SUSTAIN_MIN)
+    else:
+        blk_and, rain_and = blk_or, rain_or
+    label_obs_or = np.where(blk_or, "blockage", np.where(rain_or, "rainfall", "normal"))
+    label_obs_and = np.where(blk_and, "blockage", np.where(rain_and, "rainfall", "normal"))
+    df["gt_delta_blk"] = delta_blk                # depth effect
+    df["gt_delta_rain"] = delta_rain
+    df["gt_delta_blk_flow"] = delta_blk_f         # downstream flow effect
+    df["gt_obs_tau_depth"] = tau_d
+    df["gt_obs_tau_flow"] = tau_f if np.isfinite(tau_f) else 0.0
+
+    # --- write ALL label variants; `label` = the chosen one (A/B decide later) ---
+    variants = {"cause": label_cause, "obs_or": label_obs_or, "obs_and": label_obs_and}
+    for name, lab in variants.items():
+        df[f"label_{name}"] = lab
+        df[f"label_{name}_id"] = [LABELS[x] for x in lab]
+    scheme = params.get("label_scheme", DEFAULT_LABEL_SCHEME)
+    chosen = variants.get(scheme, label_cause)
+    df["label"] = chosen
+    df["label_id"] = [LABELS[x] for x in chosen]
 
     os.makedirs(os.path.join(out_dir, "runs"), exist_ok=True)
     pq = os.path.join(out_dir, "runs", f"{params['run_id']}.parquet")
@@ -270,10 +447,14 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
                 "final_sev", "ramp_min", "onset_min", "antecedent_dry_days",
                 "antecedent_precip_index")},
             "ramp_type": "instant" if params["ramp_min"] == 0 else "gradual",
-            "n_rows": len(df),
-            "n_blockage": int((label == "blockage").sum()),
-            "n_rainfall": int((label == "rainfall").sum()),
-            "n_normal": int((label == "normal").sum()),
+            "label_scheme": scheme, "q_ref": q_ref,
+            "obs_tau_depth": tau_d, "obs_tau_flow": (tau_f if np.isfinite(tau_f) else 0.0),
+            "n_rows": m,
+            "n_blk_cause": int((label_cause == "blockage").sum()),
+            "n_blk_obs_or": int((label_obs_or == "blockage").sum()),
+            "n_blk_obs_and": int((label_obs_and == "blockage").sum()),
+            "n_rain_obs_and": int((label_obs_and == "rainfall").sum()),
+            "n_normal_obs_and": int((label_obs_and == "normal").sum()),
             "sensor_conduits": ";".join(sensor_conduits),
             "realism": json.dumps(realism_params),
             "parquet": os.path.relpath(pq, out_dir)}
@@ -404,6 +585,10 @@ def main():
                     help="parallel processes; 0 = auto (use all CPU cores), "
                          "1 = serial (default). Never exceeds the number of runs.")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--label-scheme", choices=["cause", "obs_or", "obs_and"],
+                    default=DEFAULT_LABEL_SCHEME,
+                    help="which variant populates `label`/`label_id`; label_cause, "
+                         "label_obs_or and label_obs_and are ALL written for A/B comparison")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -421,6 +606,8 @@ def main():
                           args.routing_step, args.k_hops, qmax)
             for sc in [int(x) for x in args.scenarios.split(",")]
             for ri in range(args.n_per_scenario)]
+    for p in jobs:
+        p["label_scheme"] = args.label_scheme
 
     # choose worker count: --workers 0 (or negative) -> use all CPU cores;
     # never spawn more workers than there are runs.
@@ -459,3 +646,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+# end of file

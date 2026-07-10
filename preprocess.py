@@ -38,12 +38,19 @@ import pandas as pd
 
 EPS = 1e-6
 RAIN_GAGES = ["rg5425", "rg5427"]
-# never features (knob / schedule / target / metadata)
-META = {"label", "label_id", "run_id", "scenario", "target_conduit", "t_min",
-        "gt_severity", "split"}
-FORBIDDEN = {"gt_severity", "gt_setting", "ctx_antecedent_dry_days",
-             "ctx_antecedent_precip_index", "t_min", "timestamp",
-             "label", "label_id", "run_id", "scenario", "target_conduit"}
+# never features (knob / schedule / target / metadata / counterfactual ground truth)
+# gt_delta_* IS the observability-label basis -> feeding it would be total leakage.
+_GT = {"gt_severity", "gt_setting", "gt_flow_limit", "gt_q_ref",
+       "gt_delta_blk", "gt_delta_rain", "gt_delta_blk_flow",
+       "gt_obs_tau", "gt_obs_tau_depth", "gt_obs_tau_flow"}
+_LABELS = {"label", "label_id", "label_cause", "label_cause_id",
+           "label_obs", "label_obs_id",
+           "label_obs_or", "label_obs_or_id", "label_obs_and", "label_obs_and_id"}
+META = (_LABELS | {"run_id", "scenario", "target_conduit", "ctx_downstream_conduit",
+                   "t_min", "split"} | _GT)
+FORBIDDEN = _GT | _LABELS | {"ctx_antecedent_dry_days", "ctx_antecedent_precip_index",
+                             "t_min", "timestamp", "run_id", "scenario",
+                             "target_conduit", "ctx_downstream_conduit"}
 
 
 # --------------------------------------------------------------------------- #
@@ -74,10 +81,24 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
         b = s.rolling(base, min_periods=1).median()
         return (s - b) / (b.abs() + EPS)
 
+    # Under the flow_limit mechanism the TARGET's own flow is the imposed knob, so all
+    # flow-derived channels are read from the DOWNSTREAM conduit (the emergent flow
+    # response — it drops as less water gets through), never the target (Findings.md F8).
+    # Target DEPTH / fill are emergent backwater and stay.
+    dsrc = df["ctx_downstream_conduit"].iloc[0] if "ctx_downstream_conduit" in df.columns else ""
+
+    def _has_flow(c):
+        return bool(c) and (f"flow__{c}" in df.columns or f"flow__{c}_meas" in df.columns)
+    if not _has_flow(dsrc):
+        alt = [c[len("flow__"):] for c in df.columns
+               if c.startswith("flow__") and not c.endswith(("_meas", "_missing"))
+               and c != f"flow__{tgt}"]
+        dsrc = alt[0] if alt else tgt          # last resort: target (circular) -> avoid in prod
+
     # raw primary channels (used to DERIVE relative features; not emitted raw)
-    flow = pick(f"flow__{tgt}").ffill()
-    vel = pick(f"vel__{tgt}").ffill()
-    ushear = pick(f"ushear__{tgt}").ffill()
+    flow = pick(f"flow__{dsrc}").ffill()       # EMERGENT downstream flow (not the capped target)
+    vel = pick(f"vel__{dsrc}").ffill()
+    ushear = pick(f"ushear__{dsrc}").ffill()
     node_meas = [c for c in df.columns if c.startswith("depth__node_") and c.endswith("_meas")]
     if node_meas:
         node_depth = df[node_meas[0]].ffill()
@@ -101,14 +122,14 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
     out["blk_sig"] = out["depth_rel"] - out["flow_rel"]
 
     # --- dimensionless quantities (already location-invariant) ---
-    out["p_fill"] = df.get(f"fill__{tgt}", pd.Series(0.0, index=df.index))
-    out["p_froude"] = df.get(f"froude__{tgt}", pd.Series(0.0, index=df.index))
+    out["p_fill"] = df.get(f"fill__{tgt}", pd.Series(0.0, index=df.index))   # target depth/D: emergent
+    out["p_froude"] = df.get(f"froude__{dsrc}", pd.Series(0.0, index=df.index))  # downstream (vel-derived)
 
     # --- spatial context as RELATIVE neighbour anomalies (not absolute magnitudes) ---
     nb_depth = [c for c in df.columns if c.startswith("depth__") and
                 not c.startswith("depth__node_") and c != f"depth__{tgt}"]
     nb_flow = [c for c in df.columns if c.startswith("flow__") and c != f"flow__{tgt}"
-               and not c.endswith(("_meas", "_missing"))]
+               and c != f"flow__{dsrc}" and not c.endswith(("_meas", "_missing"))]
     out["nb_depth_rel_mean"] = (pd.concat([rel(df[c]) for c in nb_depth], axis=1).mean(axis=1)
                                 if nb_depth else 0.0)
     out["nb_flow_rel_mean"] = (pd.concat([rel(df[c]) for c in nb_flow], axis=1).mean(axis=1)
@@ -127,8 +148,8 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
     out["rain_mean"] = out[[f"rain_{g}" for g in RAIN_GAGES]].mean(axis=1)
 
     # --- dropout indicator flags (these ARE features) ---
-    for b, flag in [(f"flow__{tgt}", "p_flow_missing"), (f"vel__{tgt}", "p_vel_missing"),
-                    (f"ushear__{tgt}", "p_ushear_missing")]:
+    for b, flag in [(f"flow__{dsrc}", "p_flow_missing"), (f"vel__{dsrc}", "p_vel_missing"),
+                    (f"ushear__{dsrc}", "p_ushear_missing")]:
         out[flag] = df[b + "_missing"] if b + "_missing" in df.columns else 0
     out["p_node_depth_missing"] = (df[prim_node_base + "_missing"]
                                    if prim_node_base and prim_node_base + "_missing" in df.columns
@@ -139,6 +160,12 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
     # metadata for splitting / audit (NOT features)
     out["label_id"] = df["label_id"].values
     out["label"] = df["label"].values
+    # carry every label variant so OR/AND/cause can be A/B-compared at train time
+    # (all are in META -> never used as features)
+    for lc in ("label_cause", "label_cause_id", "label_obs_or", "label_obs_or_id",
+               "label_obs_and", "label_obs_and_id"):
+        if lc in df.columns:
+            out[lc] = df[lc].values
     out["run_id"] = df["run_id"].values
     out["scenario"] = df["scenario"].values
     out["target_conduit"] = tgt
