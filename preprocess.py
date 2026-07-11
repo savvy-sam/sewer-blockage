@@ -392,10 +392,24 @@ def main():
     ap.add_argument("--allow-incomplete-splits", action="store_true",
                     help="downgrade the class-coverage failure to a warning")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--label-col", choices=["cause", "obs_or", "obs_and"], default="obs_and",
+                    help="which label variant to train/evaluate on (A/B without regen): "
+                         "cause=blockage switched-on; obs_or=visible on either sensor; "
+                         "obs_and=visible on both sensors (default)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
     table, meta_runs = load(args.data, args.baseline_min)
+
+    # select the active label variant (cause | obs_or | obs_and) — A/B without regenerating
+    lcol = f"label_{args.label_col}"
+    if lcol in table.columns and f"{lcol}_id" in table.columns:
+        table["label"] = table[lcol].values
+        table["label_id"] = table[f"{lcol}_id"].values
+        print(f"label variant: {args.label_col}  (using column {lcol})")
+    else:
+        print(f"WARNING: label variant '{args.label_col}' not found; using existing 'label' column")
+
     # per-run class presence (computed from the actual labels, not the scenario type)
     pres = (table.assign(_b=table.label == "blockage", _r=table.label == "rainfall")
             .groupby("run_id")[["_b", "_r"]].any().rename(
