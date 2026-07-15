@@ -57,19 +57,33 @@ from rainfall import (Storm, build_intensity_series, write_rain_dat,
 from hydraulics import channel_features, circular_geometry
 from sensor_realism import apply_realism
 
-ONSET_SEVERITY = 0.10            # area fraction removed that counts as "blockage onset"
+ONSET_SEVERITY = 0.10            # blockage proportion p (ICM vertical area fraction) that
+                                 # counts as "blockage onset" for the cause-based label
 RAIN_REL_MARGIN = 0.10           # sensor depth must exceed dry baseline by >10% ...
 RAIN_ABS_MARGIN_M = 0.02         # ... and by >=0.02 m (absolute floor for small pipes)
 RAIN_BIN_MIN = 30                # time-of-day bin (min) for the diurnal dry baseline
 LABELS = {"normal": 0, "rainfall": 1, "blockage": 2}
 BASE_START = dt.datetime(2012, 6, 29, 0, 1)   # arbitrary dry anchor in the model calendar
 
-# --- blockage mechanism: runtime flow_limit cap on the real target conduit ---
-# (replaces the inline orifice, which trapped backwater at the injected node; see
-#  Findings.md F7. cap = (1 - severity) * Q_ref, Q_ref = a percentile of the pipe's
-#  own pre-onset no-blockage flow so severity bites proportionally to actual flow.)
-Q_REF_PCT = 75.0                 # percentile of pre-onset no-blockage flow used as Q_ref
-WARMUP_MIN = 120                 # skip this warm-up window (network fills from empty) for Q_ref
+# --- blockage mechanism: runtime average-loss-coefficient on the real target conduit ---
+# We add a minor-loss coefficient K to the target conduit and raise it over time to
+# represent the obstruction. `severity` here IS the InfoWorks-ICM "vertical blockage
+# proportion" p in [0,1): the fraction of the flow AREA obstructed at EVERY water level
+# (a vertical curtain / fatberg, level-independent — NOT a bottom silt deposit). For a
+# partial blockage of area fraction p the sudden-contraction (orifice) analogy gives
+#   K(p) = 1 / (1 - p)^2   (head loss h_L = K * V^2 / 2g). The flow is then an EMERGENT
+# response the solver computes (water backs up, less gets through) rather than a value we
+# impose — more defensible than the earlier flow_limit cap. This matches how industry
+# hydraulic software (InfoWorks ICM) represents a blockage, EXCEPT that SWMM exposes only a
+# single conduit Kavg, so we collapse ICM's separate contraction+expansion coefficients into
+# one Kavg via K(p) (see Findings.md F7 addendum). NB: field/column names keep the word
+# `sev`/`severity` (final_sev, gt_severity) for data reproducibility — read them as p.
+# Runtime-settable via pyswmm `link.average_head_loss` PROVIDED the conduit already has a
+# [LOSSES] entry, so we pre-seed one at K_BASE (see swmm_inp.set_conduit_loss). Confirmed
+# runtime-settable on Bellinge, overturning the earlier read (Findings.md F7).
+K_BASE = 1.0                     # baseline loss coeff seeded on the target (= K(s=0)); makes
+                                 # average_head_loss runtime-settable; applied to the twins too
+S_MAX = 0.995                    # clamp severity so K stays finite (K(0.995) ~ 40000)
 
 # --- Approach 1: observability-gated labels (label_obs), computed from paired
 #     counterfactual twins vs the physical sensor visibility floor (Findings.md F8) ---
@@ -77,8 +91,9 @@ OBS_K_SIGMA = 3.0                # a change < k*sigma of the sensor is invisible
 OBS_TAU_ABS_M = 0.01             # absolute depth floor (m) a level sensor can resolve
 OBS_SUSTAIN_MIN = 5              # effect must exceed the floor for >= this many minutes
 DEFAULT_LABEL_SCHEME = "obs_and" # which variant populates `label`/`label_id`
-                                 # (cause | obs_or | obs_and); ALL are always written so
-                                 # OR vs AND (and cause) can be A/B-compared without regen.
+                                 # (cause | obs_or | obs_and | obs_depth); ALL are always
+                                 # written so the schemes can be A/B-compared without regen.
+                                 # obs_depth = upstream level only (deployable/Branch-B).
 
 
 # --------------------------------------------------------------------------- #
@@ -118,8 +133,9 @@ def select_sensor_conduits(model: S.InpModel, target: str, k_hops: int = 2) -> l
 # --------------------------------------------------------------------------- #
 def severity_at(t_min, onset_min, ramp_min, final_sev,
                 clear_onset=None, clear_ramp=0):
-    """Blockage severity over time: ramp up to final_sev, hold, and (Scenario 6)
-    optionally clear back to 0 starting at clear_onset over clear_ramp minutes
+    """Blockage proportion p(t) over time (ICM vertical-blockage convention: fraction of
+    flow area obstructed at every water level): ramp up to final_sev (= p_max), hold, and
+    (Scenario 6) optionally clear back to 0 starting at clear_onset over clear_ramp minutes
     (clear_ramp=0 => instant removal)."""
     if final_sev <= 0 or t_min < onset_min:
         return 0.0
@@ -185,7 +201,7 @@ def _sustained(mask, m):
 def _simulate(inp_path, sensor_conduits, sensor_nodes, diam, rough,
               gages, gage_series, n_min, control=None):
     """Run one SWMM simulation and return a clean (pre-realism) per-minute DataFrame.
-    `control(i, links)` is called each step (used to set the target's flow_limit)."""
+    `control(i, links)` is called each step (used to set the target's loss coefficient)."""
     rows = []
     with Simulation(inp_path) as sim:
         links, nodes = Links(sim), Nodes(sim)
@@ -237,12 +253,13 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
     """Execute the observed run + counterfactual twins, label (cause & observability),
     write parquet, return a manifest row.
 
-    Blockage mechanism: runtime `flow_limit` cap on the real target conduit (no orifice).
-    Twins (identical seed/window; one factor toggled) give the clean causal effect used
-    for the observability-gated label (Findings.md F8):
-      * dry   : no rain,  no blockage  -> baseline
-      * noblk : rain on,  no blockage  -> isolates rain (dry_delta) + gives Q_ref
-      * main  : rain on,  blockage cap -> isolates blockage (vs noblk); the observed run
+    Blockage mechanism: runtime average-loss-coefficient K(s)=1/(1-s)^2 on the real target
+    conduit (the flow drop is emergent, not imposed). Twins (identical seed/window; one
+    factor toggled) give the clean causal effect used for the observability-gated label
+    (Findings.md F8):
+      * dry   : no rain,  no blockage  -> baseline (target carries K_BASE)
+      * noblk : rain on,  no blockage  -> isolates the rain effect
+      * main  : rain on,  blockage K(s) -> isolates the blockage (vs noblk); the observed run
     """
     rng = np.random.default_rng(params["seed"])
     n_min = params["duration_h"] * 60
@@ -284,6 +301,9 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
     base_text = S.set_simulation_window(base_model.text, start, end,
                                         report_step_s=params["report_step_s"],
                                         routing_step_s=params["routing_step_s"])
+    # seed a [LOSSES] entry on the target so average_head_loss is runtime-settable;
+    # K_BASE is the s=0 value and is carried identically by the twins (consistent baseline).
+    base_text = S.set_conduit_loss(base_text, target, kavg=K_BASE)
     if params.get("bw"):
         bw = params["bw"]
         o, rmp, hold, pk = bw["onset_min"], bw["ramp_min"], bw["hold_min"], bw["peak_cms"]
@@ -307,36 +327,20 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
 
     # --- pass 1: dry, no-blockage baseline ---
     df_dry = _sim(inp_dry, zero_series)
-    # --- pass 2: rain-on, no-blockage (rain isolation + Q_ref) ---
+    # --- pass 2: rain-on, no-blockage (isolates the rain effect) ---
     df_noblk = _sim(inp_rain, gage_series) if has_rain else df_dry
 
-    # --- Q_ref: percentile of the pipe's own pre-onset no-blockage flow, skipping
-    #     the warm-up (empty-network fill). Falls back to the whole post-warm-up run
-    #     if the pre-onset window is too short / all warm-up (else q_ref would be 0
-    #     and the cap would silently do nothing). ---
-    fcol = f"flow__{target}"
-    base_flow = np.abs(df_noblk[fcol].to_numpy(dtype=float))
-    warm = min(WARMUP_MIN, params["onset_min"])
-    hi = params["onset_min"] if params["onset_min"] > warm else len(base_flow)
-    win = base_flow[warm:hi]
-    win = win[np.isfinite(win)]
-    q_ref = float(np.percentile(win, Q_REF_PCT)) if len(win) else 0.0
-    if q_ref <= 1e-9:                                    # fallback: whole post-warm-up run
-        alt = base_flow[WARMUP_MIN:]
-        alt = alt[np.isfinite(alt)]
-        q_ref = float(np.percentile(alt, Q_REF_PCT)) if len(alt) else 0.0
-
-    # --- severity schedule + pass 3: observed run with flow_limit cap ---
+    # --- severity schedule + pass 3: observed run with the loss-coefficient obstruction ---
     severities = np.array([severity_at(i, params["onset_min"], params["ramp_min"],
                                        params["final_sev"], params.get("clear_onset_min"),
                                        params.get("clear_ramp_min", 0))
                            for i in range(n_min)])
 
-    def _cap(i, links):
-        s = severities[i] if i < len(severities) else 0.0
-        links[target].flow_limit = (1.0 - s) * q_ref if (s > 0 and q_ref > 0) else 0.0
+    def _loss(i, links):
+        s = min(severities[i] if i < len(severities) else 0.0, S_MAX)
+        links[target].average_head_loss = 1.0 / ((1.0 - s) ** 2)   # K(s); = K_BASE at s=0
 
-    df = _sim(inp_rain, gage_series, control=_cap) if has_blk else df_noblk
+    df = _sim(inp_rain, gage_series, control=_loss) if has_blk else df_noblk
 
     m = min(len(df), len(df_noblk), len(df_dry), n_min)
     df = df.iloc[:m].reset_index(drop=True)
@@ -355,10 +359,10 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
                            np.where(rain_cause, "rainfall", "normal"))
 
     # --- context / ground truth (not features) ---
-    df["gt_severity"] = severities
-    df["gt_flow_limit"] = np.where((severities > 0) & (q_ref > 0),
-                                   (1.0 - severities) * q_ref, np.nan)
-    df["gt_q_ref"] = q_ref
+    df["gt_severity"] = severities        # = ICM vertical blockage proportion p(t) in [0,1)
+    _s_clamped = np.minimum(severities, S_MAX)
+    df["gt_k_loss"] = np.where(severities > 0,
+                               1.0 / (1.0 - _s_clamped) ** 2, K_BASE)
     df["ctx_antecedent_dry_days"] = params["antecedent_dry_days"]
     df["ctx_antecedent_precip_index"] = params["antecedent_precip_index"]
     df["scenario"] = params["scenario"]
@@ -419,8 +423,13 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
         rain_and = _sustained(dep_rain & flo_rain, OBS_SUSTAIN_MIN)
     else:
         blk_and, rain_and = blk_or, rain_or
+    # depth-only: upstream LEVEL sensor alone (what almost every real CSO site has).
+    # This is the deployable-consistent label — matches the field-ready (Branch B) model.
+    blk_depth = _sustained(dep_blk, OBS_SUSTAIN_MIN)
+    rain_depth = _sustained(dep_rain, OBS_SUSTAIN_MIN)
     label_obs_or = np.where(blk_or, "blockage", np.where(rain_or, "rainfall", "normal"))
     label_obs_and = np.where(blk_and, "blockage", np.where(rain_and, "rainfall", "normal"))
+    label_obs_depth = np.where(blk_depth, "blockage", np.where(rain_depth, "rainfall", "normal"))
     df["gt_delta_blk"] = delta_blk                # depth effect
     df["gt_delta_rain"] = delta_rain
     df["gt_delta_blk_flow"] = delta_blk_f         # downstream flow effect
@@ -428,7 +437,8 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
     df["gt_obs_tau_flow"] = tau_f if np.isfinite(tau_f) else 0.0
 
     # --- write ALL label variants; `label` = the chosen one (A/B decide later) ---
-    variants = {"cause": label_cause, "obs_or": label_obs_or, "obs_and": label_obs_and}
+    variants = {"cause": label_cause, "obs_or": label_obs_or,
+                "obs_and": label_obs_and, "obs_depth": label_obs_depth}
     for name, lab in variants.items():
         df[f"label_{name}"] = lab
         df[f"label_{name}_id"] = [LABELS[x] for x in lab]
@@ -447,12 +457,13 @@ def run_one(base_model: S.InpModel, base_inp_path: str, params: dict, out_dir: s
                 "final_sev", "ramp_min", "onset_min", "antecedent_dry_days",
                 "antecedent_precip_index")},
             "ramp_type": "instant" if params["ramp_min"] == 0 else "gradual",
-            "label_scheme": scheme, "q_ref": q_ref,
+            "label_scheme": scheme, "k_loss_max": float(df["gt_k_loss"].max()),
             "obs_tau_depth": tau_d, "obs_tau_flow": (tau_f if np.isfinite(tau_f) else 0.0),
             "n_rows": m,
             "n_blk_cause": int((label_cause == "blockage").sum()),
             "n_blk_obs_or": int((label_obs_or == "blockage").sum()),
             "n_blk_obs_and": int((label_obs_and == "blockage").sum()),
+            "n_blk_obs_depth": int((label_obs_depth == "blockage").sum()),
             "n_rain_obs_and": int((label_obs_and == "rainfall").sum()),
             "n_normal_obs_and": int((label_obs_and == "normal").sum()),
             "sensor_conduits": ";".join(sensor_conduits),
@@ -585,10 +596,18 @@ def main():
                     help="parallel processes; 0 = auto (use all CPU cores), "
                          "1 = serial (default). Never exceeds the number of runs.")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--label-scheme", choices=["cause", "obs_or", "obs_and"],
+    ap.add_argument("--resume", action="store_true",
+                    help="skip runs already completed (present in the existing "
+                         "manifest.csv, else existing runs/*.parquet) and carry their "
+                         "manifest rows forward, so a stopped/crashed run continues "
+                         "instead of restarting. Use the SAME args + --seed as the "
+                         "original call so the run set is identical.")
+    ap.add_argument("--label-scheme",
+                    choices=["cause", "obs_or", "obs_and", "obs_depth"],
                     default=DEFAULT_LABEL_SCHEME,
                     help="which variant populates `label`/`label_id`; label_cause, "
-                         "label_obs_or and label_obs_and are ALL written for A/B comparison")
+                         "label_obs_or, label_obs_and and label_obs_depth (level-only, "
+                         "deployable) are ALL written for A/B comparison")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -609,12 +628,32 @@ def main():
     for p in jobs:
         p["label_scheme"] = args.label_scheme
 
+    # --- resume: skip runs already completed and carry their manifest rows forward, so
+    #     the rewritten manifest.csv stays complete. "Done" = present in the existing
+    #     manifest (authoritative); if there is no manifest, fall back to an existing
+    #     parquet. A single crash-orphan parquet (written but not yet in the manifest) is
+    #     re-run deterministically, which restores its manifest row. ---
+    manifest = []
+    if args.resume:
+        mpath = os.path.join(args.out, "manifest.csv")
+        done = set()
+        if os.path.exists(mpath):
+            prev = pd.read_csv(mpath)
+            manifest = prev.to_dict("records")
+            done = set(prev["run_id"].astype(str))
+        else:
+            rdir = os.path.join(args.out, "runs")
+            if os.path.isdir(rdir):
+                done = {f[:-8] for f in os.listdir(rdir) if f.endswith(".parquet")}
+        n0 = len(jobs)
+        jobs = [p for p in jobs if p["run_id"] not in done]
+        print(f"resume: {len(done)} already done, {n0 - len(jobs)} skipped, "
+              f"{len(jobs)} to run", flush=True)
+
     # choose worker count: --workers 0 (or negative) -> use all CPU cores;
     # never spawn more workers than there are runs.
     workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
     workers = max(1, min(workers, len(jobs)))
-
-    manifest = []
 
     def record(row):
         manifest.append(row)
@@ -646,4 +685,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# end of file
+# end of file (severity ≡ ICM vertical blockage proportion p; see F7 addendum)

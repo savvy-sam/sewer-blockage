@@ -237,6 +237,32 @@ def set_simulation_window(text: str, start_dt, end_dt, report_step_s=60, routing
     return text
 
 
+def set_conduit_loss(text: str, conduit: str, kavg: float = 1.0,
+                     kentry: float = 0.0, kexit: float = 0.0) -> str:
+    """Ensure `conduit` has a [LOSSES] entry so pyswmm's `link.average_head_loss`
+    is runtime-settable (SWMM only exposes the loss setter for links that already
+    carry a loss object). Any pre-existing entry for the conduit is replaced.
+
+    Used by the blockage mechanism: we seed Kavg = K_BASE and then raise it at
+    runtime to K(s) = 1/(1-s)^2 to represent a growing obstruction (the flow
+    response is emergent, not imposed)."""
+    lines = text.splitlines()
+    out, in_losses = [], False
+    for l in lines:
+        if re.match(r"\s*\[.+?\]\s*$", l):
+            in_losses = l.strip().upper() == "[LOSSES]"
+            out.append(l)
+            continue
+        if in_losses:
+            s = l.strip()
+            if s and not s.startswith(";") and s.split()[0] == conduit:
+                continue                      # drop stale entry for this conduit
+        out.append(l)
+    text = "\n".join(out) + "\n"
+    row = f"{conduit:<16} {kentry:<10.4g} {kexit:<10.4g} {kavg:<10.4g} NO         0"
+    return _append_to_section(text, "LOSSES", [row])
+
+
 def set_rain_file(text: str, dat_filename: str) -> str:
     """Point every RAINGAGES FILE source at our generated .dat (basename only)."""
     def repl(m):
