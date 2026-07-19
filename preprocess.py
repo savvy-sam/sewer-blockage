@@ -40,12 +40,13 @@ EPS = 1e-6
 RAIN_GAGES = ["rg5425", "rg5427"]
 # never features (knob / schedule / target / metadata / counterfactual ground truth)
 # gt_delta_* IS the observability-label basis -> feeding it would be total leakage.
-_GT = {"gt_severity", "gt_setting", "gt_flow_limit", "gt_q_ref",
+_GT = {"gt_severity", "gt_k_loss",                # gt_k_loss = 1/(1-p)^2 -> encodes severity
        "gt_delta_blk", "gt_delta_rain", "gt_delta_blk_flow",
        "gt_obs_tau", "gt_obs_tau_depth", "gt_obs_tau_flow"}
 _LABELS = {"label", "label_id", "label_cause", "label_cause_id",
            "label_obs", "label_obs_id",
-           "label_obs_or", "label_obs_or_id", "label_obs_and", "label_obs_and_id"}
+           "label_obs_or", "label_obs_or_id", "label_obs_and", "label_obs_and_id",
+           "label_obs_depth", "label_obs_depth_id"}
 META = (_LABELS | {"run_id", "scenario", "target_conduit", "ctx_downstream_conduit",
                    "t_min", "split"} | _GT)
 FORBIDDEN = _GT | _LABELS | {"ctx_antecedent_dry_days", "ctx_antecedent_precip_index",
@@ -163,7 +164,8 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
     # carry every label variant so OR/AND/cause can be A/B-compared at train time
     # (all are in META -> never used as features)
     for lc in ("label_cause", "label_cause_id", "label_obs_or", "label_obs_or_id",
-               "label_obs_and", "label_obs_and_id"):
+               "label_obs_and", "label_obs_and_id",
+               "label_obs_depth", "label_obs_depth_id"):
         if lc in df.columns:
             out[lc] = df[lc].values
     out["run_id"] = df["run_id"].values
@@ -392,10 +394,12 @@ def main():
     ap.add_argument("--allow-incomplete-splits", action="store_true",
                     help="downgrade the class-coverage failure to a warning")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--label-col", choices=["cause", "obs_or", "obs_and"], default="obs_and",
+    ap.add_argument("--label-col", choices=["cause", "obs_or", "obs_and", "obs_depth"],
+                    default="obs_and",
                     help="which label variant to train/evaluate on (A/B without regen): "
                          "cause=blockage switched-on; obs_or=visible on either sensor; "
-                         "obs_and=visible on both sensors (default)")
+                         "obs_and=visible on both sensors; obs_depth=visible on the upstream "
+                         "LEVEL sensor only (deployable/field-ready — recommended)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
