@@ -57,7 +57,8 @@ FORBIDDEN = _GT | _LABELS | {"ctx_antecedent_dry_days", "ctx_antecedent_precip_i
 # --------------------------------------------------------------------------- #
 # Per-run feature construction (causal; consistent columns across runs)
 # --------------------------------------------------------------------------- #
-def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> pd.DataFrame:
+def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240,
+                       diurnal: bool = False) -> pd.DataFrame:
     """Per-run causal features, emphasising BASELINE-RELATIVE (pipe-invariant)
     quantities. Absolute depth/flow magnitudes differ enormously between a big
     trunk sewer and a small lateral, so a model trained on them overfits to the
@@ -148,6 +149,62 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240) -> p
         out[f"rain_{g}"] = df.get(f"rain__{g}", 0.0)
     out["rain_mean"] = out[[f"rain_{g}" for g in RAIN_GAGES]].mean(axis=1)
 
+    # --- rain conditioning (v2.1, R1: Rosin et al. 2022) ---
+    # Trailing cumulative rain depth in mm (gauge values are mm VOLUME per 1-min
+    # interval, per rainfall.py) at three horizons -> lets trees learn their own
+    # wet/dry conditioning, making E[flow|rain] splittable (the wet-blockage
+    # signature blk_sig cannot express that conditional).
+    for k in (30, 60, 180):
+        out[f"rain_cum_{k}"] = out["rain_mean"].rolling(k, min_periods=1).sum()
+    # post-event flag (Rosin category 6): currently dry but wet within the last
+    # 3 h -> the lingering-inflow period where levels stay high without rain.
+    wet = out["rain_cum_60"] > 0.5                      # Rosin-style cum threshold
+    out["post_event"] = ((wet.rolling(180, min_periods=1).max() > 0) & (~wet)).astype(float)
+
+    # --- paired-level hydraulic gradient (v2.1, R5; Branch-B-compatible) ---
+    # Depth difference across the TARGET reach from the two bracketing node level
+    # sensors (a blockage = localized head loss -> a step in the water surface:
+    # upstream up, downstream down; rain moves both together). No invert
+    # elevations in the data -> this is a depth-difference, not true head; the
+    # constant datum offset cancels in the baseline-relative form. Normalised by
+    # the upstream depth baseline (NOT fractional-anomaly of the gradient itself,
+    # which is unstable around zero).
+    node_names = [c[len("depth__node_"):] for c in df.columns
+                  if c.startswith("depth__node_") and not c.endswith(("_meas", "_missing"))]
+    up_n = dn_n = None
+    for a in node_names:                       # conduit id convention: <up>_<down>_l<k>
+        for b in node_names:
+            if a != b and tgt.startswith(f"{a}_") and tgt[len(a) + 1:].startswith(b):
+                up_n, dn_n = a, b
+    if up_n and dn_n:
+        d_up = pick(f"depth__node_{up_n}").ffill()
+        d_dn = pick(f"depth__node_{dn_n}").ffill()
+        grad = d_up - d_dn
+        gbase = grad.rolling(base, min_periods=1).median()
+        # 1 cm floor (same as the observability gate) - near-dry pipes have
+        # ~zero baseline depth and would otherwise explode the normalisation
+        denom = d_up.rolling(base, min_periods=1).median().abs().clip(lower=0.01)
+        out["grad_rel"] = (grad - gbase) / denom
+        out["dgrad_5"] = grad.diff(5) / denom
+    else:                                      # pair not recorded -> neutral zeros
+        out["grad_rel"] = 0.0
+        out["dgrad_5"] = 0.0
+
+    # --- diurnal-aware dry-weather baseline (v2.1, R3, opt-in A/B) ---
+    # Baseline = causal median of the SAME time-of-day over previous days
+    # (Rosin: dry-weather mu/sigma per time-of-day; TDRM: per-day diurnal
+    # profiles). Falls back to the rolling median on day 0 (no history yet).
+    if diurnal:
+        t = df["t_min"].to_numpy()
+        mod = pd.Series(t % 1440, index=df.index)
+        diur = (node_depth.groupby(mod)
+                .apply(lambda g: g.expanding().median().shift(1))
+                .reset_index(level=0, drop=True)
+                .sort_index())
+        fallback = node_depth.rolling(base, min_periods=1).median()
+        diur = diur.fillna(fallback)
+        out["depth_rel_diur"] = (node_depth - diur) / diur.abs().clip(lower=0.01)
+
     # --- dropout indicator flags (these ARE features) ---
     for b, flag in [(f"flow__{dsrc}", "p_flow_missing"), (f"vel__{dsrc}", "p_vel_missing"),
                     (f"ushear__{dsrc}", "p_ushear_missing")]:
@@ -183,14 +240,14 @@ def feature_columns(table: pd.DataFrame) -> list:
 # --------------------------------------------------------------------------- #
 # Loading
 # --------------------------------------------------------------------------- #
-def load(data_dir: str, base: int = 240):
+def load(data_dir: str, base: int = 240, diurnal: bool = False):
     files = sorted(glob.glob(os.path.join(data_dir, "runs", "*.parquet")))
     if not files:
         raise FileNotFoundError(f"no parquet under {data_dir}/runs/")
     feats, meta_rows = [], []
     for f in files:
         df = pd.read_parquet(f)
-        feats.append(build_run_features(df, base=base))
+        feats.append(build_run_features(df, base=base, diurnal=diurnal))
         rain_cols = [c for c in df.columns if c.startswith("rain__")]
         total_rain = float(df[rain_cols].to_numpy().sum()) if rain_cols else 0.0
         meta_rows.append(dict(run_id=df["run_id"].iloc[0], scenario=df["scenario"].iloc[0],
@@ -393,6 +450,10 @@ def main():
                     help="min runs containing each of blockage/rainfall in val & test")
     ap.add_argument("--allow-incomplete-splits", action="store_true",
                     help="downgrade the class-coverage failure to a warning")
+    ap.add_argument("--diurnal-baseline", action="store_true",
+                    help="add depth_rel_diur: depth anomaly vs a causal same-time-of-day "
+                         "median over previous days (R3 A/B; DWF diurnal pattern verified "
+                         "in data_v2, peak/trough ~1.9)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--label-col", choices=["cause", "obs_or", "obs_and", "obs_depth"],
                     default="obs_and",
@@ -403,7 +464,7 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    table, meta_runs = load(args.data, args.baseline_min)
+    table, meta_runs = load(args.data, args.baseline_min, diurnal=args.diurnal_baseline)
 
     # select the active label variant (cause | obs_or | obs_and) — A/B without regenerating
     lcol = f"label_{args.label_col}"
