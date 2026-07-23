@@ -83,6 +83,20 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240,
         b = s.rolling(base, min_periods=1).median()
         return (s - b) / (b.abs() + EPS)
 
+    _mod = (df["t_min"].astype(int) % 1440)       # time-of-day (min) for diurnal baseline
+
+    def rel_floor(series):                        # like rel() but 1cm denom floor (near-dry
+        s = series.astype(float)                  # node sensors have ~0 baseline -> blowups)
+        b = s.rolling(base, min_periods=1).median()
+        return (s - b) / b.abs().clip(lower=0.01)
+
+    def rel_diur(series):                         # anomaly vs causal same-time-of-day median
+        s = series.astype(float)
+        d = (s.groupby(_mod).apply(lambda g: g.expanding().median().shift(1))
+             .reset_index(level=0, drop=True).sort_index())
+        d = d.fillna(s.rolling(base, min_periods=1).median())   # warmup: rolling fallback
+        return (s - d) / d.abs().clip(lower=0.01)
+
     # Under the flow_limit mechanism the TARGET's own flow is the imposed knob, so all
     # flow-derived channels are read from the DOWNSTREAM conduit (the emergent flow
     # response — it drops as less water gets through), never the target (Findings.md F8).
@@ -136,6 +150,28 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240,
                                 if nb_depth else 0.0)
     out["nb_flow_rel_mean"] = (pd.concat([rel(df[c]) for c in nb_flow], axis=1).mean(axis=1)
                                if nb_flow else 0.0)
+
+    # --- neighbour NODE level-sensor spatial features (v2.1, R+; Branch-B-compatible) ---
+    # A blockage is spatially LOCAL (target rises above neighbours); rain is
+    # catchment-WIDE (target and neighbours rise together). Built from the OTHER
+    # node level sensors so they are apples-to-apples with the target's depth_rel
+    # (which also comes from a node), unlike nb_depth_rel_mean (conduit depths).
+    nb_nodes = [c for c in df.columns if c.startswith("depth__node_")
+                and not c.endswith(("_meas", "_missing")) and c != prim_node_base]
+    if nb_nodes:
+        nn_rel = pd.concat([rel_floor(df[c]) for c in nb_nodes], axis=1)
+        nn_mean = nn_rel.mean(axis=1)
+        out["nb_node_depth_rel_mean"] = nn_mean
+        out["nb_node_depth_rel_std"] = nn_rel.std(axis=1).fillna(0.0)   # dispersion: blockage>rain
+        out["nb_node_depth_rel_max"] = nn_rel.max(axis=1)
+        # spatial contrast — the spatial analogue of blk_sig: large only when the
+        # target rises ABOVE its neighbours (blockage), ~0 when all rise (rain).
+        # target term uses the floored rel too, for a consistent scale.
+        out["depth_spatial_contrast"] = rel_floor(node_depth) - nn_mean
+    else:
+        for c in ("nb_node_depth_rel_mean", "nb_node_depth_rel_std",
+                  "nb_node_depth_rel_max", "depth_spatial_contrast"):
+            out[c] = 0.0
 
     # --- relative rate-of-change (fractional change vs baseline; captures onset) ---
     base_depth = node_depth.rolling(base, min_periods=1).median().abs() + EPS
@@ -195,15 +231,17 @@ def build_run_features(df: pd.DataFrame, diff_lags=(1, 5), base: int = 240,
     # (Rosin: dry-weather mu/sigma per time-of-day; TDRM: per-day diurnal
     # profiles). Falls back to the rolling median on day 0 (no history yet).
     if diurnal:
-        t = df["t_min"].to_numpy()
-        mod = pd.Series(t % 1440, index=df.index)
-        diur = (node_depth.groupby(mod)
-                .apply(lambda g: g.expanding().median().shift(1))
-                .reset_index(level=0, drop=True)
-                .sort_index())
-        fallback = node_depth.rolling(base, min_periods=1).median()
-        diur = diur.fillna(fallback)
-        out["depth_rel_diur"] = (node_depth - diur) / diur.abs().clip(lower=0.01)
+        out["depth_rel_diur"] = rel_diur(node_depth)          # target upstream node
+        # neighbour NODE spatial features on the diurnal baseline (A/B vs flat)
+        if nb_nodes:
+            nn_d = pd.concat([rel_diur(df[c]) for c in nb_nodes], axis=1)
+            out["nb_node_depth_rel_diur_mean"] = nn_d.mean(axis=1)
+            out["nb_node_depth_rel_diur_std"] = nn_d.std(axis=1).fillna(0.0)
+            out["depth_spatial_contrast_diur"] = out["depth_rel_diur"] - nn_d.mean(axis=1)
+        else:
+            for c in ("nb_node_depth_rel_diur_mean", "nb_node_depth_rel_diur_std",
+                      "depth_spatial_contrast_diur"):
+                out[c] = 0.0
 
     # --- dropout indicator flags (these ARE features) ---
     for b, flag in [(f"flow__{dsrc}", "p_flow_missing"), (f"vel__{dsrc}", "p_vel_missing"),
